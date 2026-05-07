@@ -94,7 +94,19 @@ def parse_args() -> argparse.Namespace:
         "--tolerance-pct",
         type=positive_float,
         default=DEFAULT_TOLERANCE_PCT,
-        help="價格距離 12EMA、布林中軌或下軌的容忍百分比，預設 1。",
+        help="價格距離日線 12EMA、布林中軌或下軌的容忍百分比，預設 1。",
+    )
+    parser.add_argument(
+        "--weekly-tolerance-pct",
+        type=positive_float,
+        default=3.0,
+        help="價格距離週線 12EMA、布林中軌或下軌的容忍百分比，預設 3。",
+    )
+    parser.add_argument(
+        "--monthly-tolerance-pct",
+        type=positive_float,
+        default=5.0,
+        help="價格距離月線 12EMA、布林中軌或下軌的容忍百分比，預設 5。",
     )
     return parser.parse_args()
 
@@ -190,8 +202,8 @@ def chunked(items: Iterable[TaiwanStock], size: int) -> Iterable[list[TaiwanStoc
 
 
 def lookback_start() -> date:
-    # 需要覆蓋去年整年、今年至今與近 21 日布林計算。
-    return min(LAST_YEAR_START, TODAY - timedelta(days=120))
+    # 需要覆蓋去年整年、今年至今與近 21 個月布林計算（約 900 天）。
+    return min(LAST_YEAR_START, TODAY - timedelta(days=900))
 
 
 def normalize_download_frame(
@@ -258,10 +270,9 @@ def within_pct(value: float, target: float, tolerance_pct: float) -> bool:
     return abs(value - target) / abs(target) * 100.0 <= tolerance_pct
 
 
-def evaluate_daily(close: pd.Series, tolerance_pct: float) -> dict[str, float | str] | None:
-    series = close.dropna()
+def evaluate_series(series: pd.Series, tolerance_pct: float, prefix: str) -> list[str]:
     if len(series) < BOLLINGER_WINDOW:
-        return None
+        return []
 
     ema12 = series.ewm(span=EMA_SPAN, adjust=False).mean()
     middle = series.rolling(window=BOLLINGER_WINDOW).mean()
@@ -277,36 +288,23 @@ def evaluate_daily(close: pd.Series, tolerance_pct: float) -> dict[str, float | 
         }
     ).dropna()
     if snapshot.empty:
-        return None
+        return []
 
     latest = snapshot.iloc[-1]
     close_price = float(latest["close"])
     ema12 = float(latest["ema12"])
     middle = float(latest["middle"])
     lower = float(latest["lower"])
-    near_ema12 = within_pct(close_price, ema12, tolerance_pct)
-    near_middle = within_pct(close_price, middle, tolerance_pct)
-    near_lower = within_pct(close_price, lower, tolerance_pct)
-
+    
     matched_reasons: list[str] = []
-    if near_ema12:
-        matched_reasons.append("near_ema12")
-    if near_middle:
-        matched_reasons.append("near_middle")
-    if near_lower:
-        matched_reasons.append("near_lower")
+    if within_pct(close_price, ema12, tolerance_pct):
+        matched_reasons.append(f"{prefix}_near_ema12")
+    if within_pct(close_price, middle, tolerance_pct):
+        matched_reasons.append(f"{prefix}_near_middle")
+    if within_pct(close_price, lower, tolerance_pct):
+        matched_reasons.append(f"{prefix}_near_lower")
 
-    return {
-        "close": round(close_price, 2),
-        "ema12": round(ema12, 2),
-        "middle": round(middle, 2),
-        "lower": round(lower, 2),
-        "status": "near_band" if matched_reasons else "outside",
-        "matched_reason": ",".join(matched_reasons),
-        "ema12_diff_pct": round(abs(close_price - ema12) / abs(ema12) * 100.0, 2),
-        "middle_diff_pct": round(abs(close_price - middle) / abs(middle) * 100.0, 2),
-        "lower_diff_pct": round(abs(close_price - lower) / abs(lower) * 100.0, 2),
-    }
+    return matched_reasons
 
 
 def period_gain(close: pd.Series, start_date: date, end_date: date | None = None) -> float | None:
@@ -326,6 +324,8 @@ def screen_stocks(
     histories: dict[str, pd.DataFrame],
     min_gain: float,
     tolerance_pct: float,
+    weekly_tolerance_pct: float,
+    monthly_tolerance_pct: float,
 ) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
 
@@ -351,6 +351,24 @@ def screen_stocks(
         if not notes:
             continue
 
+        matched_reasons = []
+        
+        # Daily
+        matched_reasons.extend(evaluate_series(close, tolerance_pct, "daily"))
+        
+        # Weekly
+        weekly_series = close.resample("W-FRI").last().dropna()
+        if not weekly_series.empty:
+            matched_reasons.extend(evaluate_series(weekly_series, weekly_tolerance_pct, "weekly"))
+            
+        # Monthly
+        monthly_series = close.resample("ME").last().dropna()
+        if not monthly_series.empty:
+            matched_reasons.extend(evaluate_series(monthly_series, monthly_tolerance_pct, "monthly"))
+
+        if not matched_reasons:
+            continue
+
         result: dict[str, object] = {
             "code": stock.code,
             "name": stock.name,
@@ -359,22 +377,10 @@ def screen_stocks(
             "last_year_gain_pct": round(last_year_gain, 2) if last_year_gain is not None else "",
             "ytd_gain_pct": round(this_year_gain, 2) if this_year_gain is not None else "",
             "note": "；".join(notes),
+            "matched_reason": ",".join(matched_reasons),
         }
 
-        daily_result = evaluate_daily(close, tolerance_pct)
-        if daily_result is None:
-            continue
-
-        result["ema12"] = daily_result["ema12"]
-        result["middle"] = daily_result["middle"]
-        result["lower"] = daily_result["lower"]
-        result["matched_reason"] = daily_result["matched_reason"]
-        result["ema12_diff_pct"] = daily_result["ema12_diff_pct"]
-        result["middle_diff_pct"] = daily_result["middle_diff_pct"]
-        result["lower_diff_pct"] = daily_result["lower_diff_pct"]
-
-        if daily_result["status"] == "near_band":
-            rows.append(result)
+        rows.append(result)
 
     table = pd.DataFrame(rows)
     if table.empty:
@@ -413,9 +419,15 @@ def build_export_table(result: pd.DataFrame) -> pd.DataFrame:
 
 def localize_matched_reason(value: str) -> str:
     reason_map = {
-        "near_ema12": "價格接近12EMA",
-        "near_middle": "價格接近中軌",
-        "near_lower": "價格接近下軌",
+        "daily_near_ema12": "日線接近12EMA",
+        "daily_near_middle": "日線接近中軌",
+        "daily_near_lower": "日線接近下軌",
+        "weekly_near_ema12": "週線接近12EMA",
+        "weekly_near_middle": "週線接近中軌",
+        "weekly_near_lower": "週線接近下軌",
+        "monthly_near_ema12": "月線接近12EMA",
+        "monthly_near_middle": "月線接近中軌",
+        "monthly_near_lower": "月線接近下軌",
     }
 
     return "、".join(reason_map.get(reason, reason) for reason in value.split(",") if reason)
@@ -447,6 +459,8 @@ def main() -> None:
         histories=histories,
         min_gain=args.min_gain,
         tolerance_pct=args.tolerance_pct,
+        weekly_tolerance_pct=args.weekly_tolerance_pct,
+        monthly_tolerance_pct=args.monthly_tolerance_pct,
     )
 
     if result.empty:
